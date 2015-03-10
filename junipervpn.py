@@ -1,25 +1,22 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
 
-import subprocess
-import mechanize
-import cookielib
-import getpass
-import sys
-import os
-import ssl
 import argparse
-import atexit
-import signal
-import ConfigParser
-import time
 import binascii
-import hmac
+import getpass
 import hashlib
+import hmac
 import shlex
-import tncc
+import signal
+import subprocess
+import sys
+import time
 
-ssl._create_default_https_context = ssl._create_unverified_context
+from selenium import webdriver
+from six import iteritems, print_
+from six.moves import configparser
+
+
 
 """
 OATH code from https://github.com/bdauvergne/python-oath
@@ -36,6 +33,7 @@ Copyright 2010, Benjamin Dauvergne
        documentation and/or other materials provided with the distribution.'''
 """
 
+
 def truncated_value(h):
     bytes = map(ord, h)
     offset = bytes[-1] & 0xf
@@ -43,10 +41,12 @@ def truncated_value(h):
             (bytes[offset+2] & 0xff) << 8 | (bytes[offset+3] & 0xff)
     return v
 
-def dec(h,p):
+
+def dec(h, p):
     v = truncated_value(h)
-    v = v % (10**p)
+    v %= 10**p
     return '%0*d' % (p, v)
+
 
 def int2beint64(i):
     hex_counter = hex(long(i))[2:-1]
@@ -54,72 +54,59 @@ def int2beint64(i):
     bin_counter = binascii.unhexlify(hex_counter)
     return bin_counter
 
+
 def hotp(key):
     key = binascii.unhexlify(key)
     counter = int2beint64(int(time.time()) / 30)
     return dec(hmac.new(key, counter, hashlib.sha256).digest(), 6)
 
-class juniper_vpn(object):
+
+class JuniperVpn(object):
     def __init__(self, args):
         self.args = args
         self.fixed_password = args.password is not None
         self.last_connect = 0
 
-        self.br = mechanize.Browser()
-
-        self.cj = cookielib.LWPCookieJar()
-        self.br.set_cookiejar(self.cj)
-
-        # Browser options
-        self.br.set_handle_equiv(True)
-        self.br.set_handle_redirect(True)
-        self.br.set_handle_referer(True)
-        self.br.set_handle_robots(False)
-
-        # Follows refresh 0 but not hangs on refresh > 0
-        self.br.set_handle_refresh(mechanize._http.HTTPRefreshProcessor(),
-                              max_time=1)
-
-        # Want debugging messages?
-        #self.br.set_debug_http(True)
-        #self.br.set_debug_redirects(True)
-        #self.br.set_debug_responses(True)
-
-        self.user_agent = 'Mozilla/5.0 (X11; U; Linux i686; en-US; rv:1.9.0.1) Gecko/2008071615 Fedora/3.0.1-1.fc9 Firefox/3.0.1'
-        self.br.addheaders = [('User-agent', self.user_agent)]
+        self.br = webdriver.PhantomJS(service_args=['--ignore-ssl-errors=true'])
+        self.br.set_window_size(1024, 768)
+        self.br.implicitly_wait(1)
 
         self.last_action = None
         self.needs_2factor = False
         self.key = None
+        self.p = None
+        self.shutting_down = False
 
     def find_cookie(self, name):
-        for cookie in self.cj:
-            if cookie.name == name:
-                return cookie
-        return None
+        return self.br.get_cookie(name)
 
     def next_action(self):
         if self.find_cookie('DSID'):
             return 'connect'
 
-        for form in self.br.forms():
-            if form.name == 'frmLogin':
+        for form in self.br.find_elements_by_tag_name('form'):
+            form_name = form.get_attribute('name')
+            if form_name == 'frmLogin':
                 return 'login'
-            elif form.name == 'frmDefender':
+            elif form_name == 'frmDefender':
                 return 'key'
-            elif form.name == 'frmConfirmation':
+            elif form_name == 'frmConfirmation':
                 return 'continue'
             else:
-                raise Exception('Unknown form type:', form.name)
-        return 'tncc'
+                raise Exception('Unknown form type:', form_name)
+        raise Exception('No form found!')
 
     def run(self):
         # Open landing page
-        self.r = self.br.open('https://' + self.args.host)
+        self.br.get('https://' + self.args.host)
+
         while True:
+            if self.shutting_down:
+                break
+
             action = self.next_action()
-            if action == 'tncc':
-                self.action_tncc()
+            if self.args.verbose:
+                print_('Action:', action)
             elif action == 'login':
                 self.action_login()
             elif action == 'key':
@@ -131,18 +118,6 @@ class juniper_vpn(object):
 
             self.last_action = action
 
-    def action_tncc(self):
-        # Run tncc host checker
-        dspreauth_cookie = self.find_cookie('DSPREAUTH')
-        if dspreauth_cookie is None:
-            raise Exception('Could not find DSPREAUTH key for host checker')
-
-        dssignin_cookie = self.find_cookie('DSSIGNIN')
-        t = tncc.tncc(self.args.host);
-        self.cj.set_cookie(t.get_cookie(dspreauth_cookie, dssignin_cookie))
-
-        self.r = self.br.open(self.r.geturl())
-
     def action_login(self):
         # The token used for two-factor is selected when this form is submitted.
         # If we aren't getting a password, then get the key now, otherwise
@@ -151,7 +126,7 @@ class juniper_vpn(object):
 
         if self.args.password is None or self.last_action == 'login':
             if self.fixed_password:
-                print 'Login failed (Invalid username or password?)'
+                print_('Login failed (Invalid username or password?)')
                 sys.exit(1)
             else:
                 self.args.password = getpass.getpass('Password:')
@@ -166,64 +141,77 @@ class juniper_vpn(object):
             self.key = None
 
         # Enter username/password
-        self.br.select_form(nr=0)
-        self.br.form['username'] = self.args.username
-        self.br.form['password'] = self.args.password
-        # Untested, a list of availables realms is provided when this
-        # is necessary.
-        # self.br.form['realm'] = [realm]
-        self.r = self.br.submit()
+        self.post_form(
+            username=self.args.username, password=self.args.password)
 
     def action_key(self):
         # Enter key
         self.needs_2factor = True
         if self.args.oath:
             if self.last_action == 'key':
-                print 'Login failed (Invalid OATH key)'
+                print_('Login failed (Invalid OATH key)')
                 sys.exit(1)
             self.key = hotp(self.args.oath)
         elif self.key is None:
             self.key = getpass.getpass('Two-factor key:')
-        self.br.select_form(nr=0)
-        self.br.form['password'] = self.key
-        self.key = None
-        self.r = self.br.submit()
+
+        self.post_form(password=self.key)
 
     def action_continue(self):
-        # Yes, I want to terminate the existing connection
-        self.br.select_form(nr=0)
-        self.r = self.br.submit()
+        # Yes, I want to terminate the existing connections
+        checkboxes = self.br.find_elements_by_css_selector('input[type=checkbox]')
+        for checkbox in checkboxes:
+            checkbox.click()
+        self.post_form()
 
     def action_connect(self):
         now = time.time()
         delay = 10.0 - (now - self.last_connect)
         if delay > 0:
-            print 'Waiting %.0f...' % (delay)
+            print_('Waiting %.0f...' % (delay))
             time.sleep(delay)
-        self.last_connect = time.time();
+        self.last_connect = time.time()
 
-        dsid = self.find_cookie('DSID').value
+        dsid = self.find_cookie('DSID')['value']
         action = []
         for arg in self.args.action:
             arg = arg.replace('%DSID%', dsid).replace('%HOST%', self.args.host)
             action.append(arg)
 
-        p = subprocess.Popen(action, stdin=subprocess.PIPE)
+        print_('Running subcommand:', action)
+        self.p = subprocess.Popen(action,
+                             stdin=subprocess.PIPE,
+                             universal_newlines=True)
         if args.stdin is not None:
             stdin = args.stdin.replace('%DSID%', dsid)
             stdin = stdin.replace('%HOST%', self.args.host)
-            p.communicate(input = stdin)
+            self.p.communicate(input=stdin)
         else:
-            ret = p.wait()
-        ret = p.returncode
+            self.p.wait()
+        ret = self.p.returncode
+        self.p = None
 
         # Openconnect specific
         if ret == 2:
-            self.cj.clear(self.args.host, '/', 'DSID')
-            self.r = self.br.open(self.r.geturl())
+            print_('Connect command failed, retrying!')
+            self.br.delete_cookie('DSID')
+            self.br.get(self.br.current_url)
+        else:
+            print_('Connect command retcode:', ret)
 
-def cleanup():
-    os.killpg(0, signal.SIGTERM)
+    def post_form(self, **overrides):
+        form = self.br.find_elements_by_tag_name('form')[0]
+        for input_name, input_value in iteritems(overrides):
+            input_elt = form.find_element_by_name(input_name)
+            input_elt.send_keys(input_value)
+
+        form.find_element_by_css_selector('input[type=submit]').click()
+
+    def handle_signal(self, signum, frame):
+        self.shutting_down = True
+        if self.p and self.p.poll() is None:
+            self.p.send_signal(signum)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(conflict_handler='resolve')
@@ -237,6 +225,8 @@ if __name__ == "__main__":
                         help='Config file')
     parser.add_argument('-s', '--stdin', type=str,
                         help="String to pass to action's stdin")
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help="Enable verbose output")
     parser.add_argument('action', nargs=argparse.REMAINDER,
                         metavar='<action> [<args...>]',
                         help='External command')
@@ -251,7 +241,7 @@ if __name__ == "__main__":
         args.action = None
 
     if args.config is not None:
-        config = ConfigParser.RawConfigParser()
+        config = configparser.RawConfigParser()
         config.read(args.config)
         for arg in ['username', 'host', 'password', 'oath', 'action', 'stdin']:
             if args.__dict__[arg] is None:
@@ -263,11 +253,12 @@ if __name__ == "__main__":
     if not isinstance(args.action, list):
         args.action = shlex.split(args.action)
 
-    if args.username == None or args.host == None or args.action == []:
-        print "--user, --host, and <action> are required parameters"
+    if args.username is None or args.host is None or args.action == []:
+        print_("--user, --host, and <action> are required parameters")
         sys.exit(1)
 
-    atexit.register(cleanup)
-    jvpn = juniper_vpn(args)
+    jvpn = JuniperVpn(args)
+    signal.signal(signal.SIGINT, jvpn.handle_signal)
+    signal.signal(signal.SIGTERM, jvpn.handle_signal)
     jvpn.run()
 

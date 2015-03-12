@@ -38,7 +38,7 @@ def truncated_value(h):
     bytes = map(ord, h)
     offset = bytes[-1] & 0xf
     v = (bytes[offset] & 0x7f) << 24 | (bytes[offset+1] & 0xff) << 16 | \
-            (bytes[offset+2] & 0xff) << 8 | (bytes[offset+3] & 0xff)
+        (bytes[offset+2] & 0xff) << 8 | (bytes[offset+3] & 0xff)
     return v
 
 
@@ -180,8 +180,8 @@ class JuniperVpn(object):
 
         print_('Running subcommand:', action)
         self.p = subprocess.Popen(action,
-                             stdin=subprocess.PIPE,
-                             universal_newlines=True)
+                                  stdin=subprocess.PIPE,
+                                  universal_newlines=True)
         if args.stdin is not None:
             stdin = args.stdin.replace('%DSID%', dsid)
             stdin = stdin.replace('%HOST%', self.args.host)
@@ -243,11 +243,11 @@ if __name__ == "__main__":
     if args.config is not None:
         config = configparser.RawConfigParser()
         config.read(args.config)
-        for arg in ['username', 'host', 'password', 'oath', 'action', 'stdin']:
+        for arg in ['username', 'host', 'password', 'oath', 'action', 'stdin', 'verbose']:
             if args.__dict__[arg] is None:
                 try:
                     args.__dict__[arg] = config.get('vpn', arg)
-                except:
+                except configparser.Error:
                     pass
 
     if not isinstance(args.action, list):
